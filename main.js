@@ -14,7 +14,8 @@ import {
 
 import io from 'socket.io-client';
 
-const socket = io.connect('https://react-native-webrtc.herokuapp.com', {transports: ['websocket']});
+//const socket = io.connect('https://react-native-webrtc.herokuapp.com', {transports: ['websocket']});
+//const socket = io.connect('wss://react-native-webrtc.herokuapp.com');
 
 import {
   RTCPeerConnection,
@@ -26,11 +27,692 @@ import {
   getUserMedia,
 } from 'react-native-webrtc';
 
-const configuration = {"iceServers": [{"url": "stun:stun.l.google.com:19302"}]};
+const configuration = {"iceServers": [{"url": "turn:120.55.192.228:3478?transport=udp"},{"url": "turn:120.55.192.228:3478?transport=tcp"},{"url": "turn:120.55.192.228:3479?transport=udp"},{"url": "turn:120.55.192.228:3479?transport=tcp"}]};
 
 const pcPeers = {};
 let localStream;
+// Create our JsSIP instance and run it:
+import SIP from 'sip.js';
 
+
+var env = {};
+env.getUserMedia = getUserMedia;
+SIP.WebRTC.MediaStream = RTCMediaStream;
+SIP.WebRTC.getUserMedia = SIP.Utils.promisify(env, 'getUserMedia');
+SIP.WebRTC.RTCPeerConnection = RTCPeerConnection;
+SIP.WebRTC.RTCSessionDescription = RTCSessionDescription;
+    
+    var MediaHandler = function(session, options) {
+        options = options || {};
+        
+        this.logger = session.ua.getLogger('sip.invitecontext.mediahandler', session.id);
+        this.session = session;
+        this.localMedia = localStream;
+        this.ready = true;
+        this.mediaStreamManager = options.mediaStreamManager || new SIP.WebRTC.MediaStreamManager(this.logger);
+        this.audioMuted = false;
+        this.videoMuted = false;
+        this.local_hold = false;
+        this.remote_hold = false;
+        this.candidates = new Array;
+        // old init() from here on
+        var servers = this.prepareIceServers(options.stunServers, options.turnServers);
+        this.RTCConstraints = options.RTCConstraints || {};
+        
+        this.initPeerConnection(servers);
+        
+        function selfEmit(mh, event) {
+            if (mh.mediaStreamManager.on) {
+                mh.mediaStreamManager.on(event, function () {
+                                         mh.emit.apply(mh, [event].concat(Array.prototype.slice.call(arguments)));
+                                         });
+            }
+        }
+        
+        selfEmit(this, 'userMediaRequest');
+        selfEmit(this, 'userMedia');
+        selfEmit(this, 'userMediaFailed');
+    };
+    
+    MediaHandler.defaultFactory = function defaultFactory (session, options) {
+        return new MediaHandler(session, options);
+    };
+    MediaHandler.defaultFactory.isSupported = function () {
+        return true;
+    };
+    
+    MediaHandler.prototype = Object.create(SIP.MediaHandler.prototype, {
+                                           // Functions the session can use
+                                           isReady: {writable: true, value: function isReady () {
+                                           return this.ready;
+                                           }},
+                                           
+                                           close: {writable: true, value: function close () {
+                                           this.logger.log('closing PeerConnection');
+                                           this._remoteStreams = [];
+                                           // have to check signalingState since this.close() gets called multiple times
+                                           // TODO figure out why that happens
+                                           if(this.peerConnection && this.peerConnection.signalingState !== 'closed') {
+                                           this.peerConnection.close();
+                                           
+                                           if(this.localMedia) {
+                                           this.mediaStreamManager.release(this.localMedia);
+                                           }
+                                           }
+                                           }},
+                                           
+                                           /**
+                                            * @param {SIP.WebRTC.MediaStream | (getUserMedia constraints)} [mediaHint]
+                                            *        the MediaStream (or the constraints describing it) to be used for the session
+                                            */
+                                           getDescription: {writable: true, value: function getDescription (mediaHint) {
+                                           var self = this;
+                                           var acquire = self.mediaStreamManager.acquire;
+                                           if (acquire.length > 1) {
+                                           acquire = SIP.Utils.promisify(this.mediaStreamManager, 'acquire', true);
+                                           }
+                                           mediaHint = mediaHint || {};
+                                           if (mediaHint.dataChannel === true) {
+                                           mediaHint.dataChannel = {};
+                                           }
+                                           this.mediaHint = mediaHint;
+                                           
+                                           /*
+                                            * 1. acquire streams (skip if MediaStreams passed in)
+                                            * 2. addStreams
+                                            * 3. createOffer/createAnswer
+                                            */
+                                           
+                                           var streamPromise;
+                                           //self.localMedia = localStream;
+                                           if (self.localMedia) {
+                                           self.logger.log('already have local media');
+                                           streamPromise = SIP.Utils.Promise.resolve(self.localMedia);
+                                           }
+                                           else {
+                                           self.logger.log('acquiring local media');
+                                           
+                                           streamPromise = acquire.call(self.mediaStreamManager, mediaHint)
+                                           .then(function acquireSucceeded(streams) {
+                                                 self.logger.log('acquired local media streams');
+                                                 self.localMedia = streams;
+                                                 self.session.connecting();
+                                                 return streams;
+                                                 }, function acquireFailed(err) {
+                                                 self.logger.error('unable to acquire streams');
+                                                 self.logger.error(err);
+                                                 self.session.connecting();
+                                                 throw err;
+                                                 })
+                                           .then(this.addStreams.bind(this))
+                                           ;
+                                           }
+                                           
+                                           return streamPromise
+                                           .then(function streamAdditionSucceeded() {
+                                                 if (self.hasOffer('remote')) {
+                                                 self.peerConnection.ondatachannel = function (evt) {
+                                                 self.dataChannel = evt.channel;
+                                                 self.emit('dataChannel', self.dataChannel);
+                                                 };
+                                                 } else if (mediaHint.dataChannel &&
+                                                            self.peerConnection.createDataChannel) {
+                                                 self.dataChannel = self.peerConnection.createDataChannel(
+                                                                                                          'sipjs',
+                                                                                                          mediaHint.dataChannel
+                                                                                                          );
+                                                 self.emit('dataChannel', self.dataChannel);
+                                                 }
+                                                 
+                                                 self.render();
+                                                 return self.createOfferOrAnswer(self.RTCConstraints);
+                                                 })
+                                           .then(function(sdp) {
+                                                 sdp = SIP.Hacks.Firefox.hasMissingCLineInSDP(sdp);
+                                                 
+                                                 if (self.local_hold) {
+                                                 // Don't receive media
+                                                 // TODO - This will break for media streams with different directions.
+                                                 if (!(/a=(sendrecv|sendonly|recvonly|inactive)/).test(sdp)) {
+                                                 sdp = sdp.replace(/(m=[^\r]*\r\n)/g, '$1a=sendonly\r\n');
+                                                 } else {
+                                                 sdp = sdp.replace(/a=sendrecv\r\n/g, 'a=sendonly\r\n');
+                                                 sdp = sdp.replace(/a=recvonly\r\n/g, 'a=inactive\r\n');
+                                                 }
+                                                 }
+                                                 
+                                                 return {
+                                                 body: sdp,
+                                                 contentType: 'application/sdp'
+                                                 };
+                                                 })
+                                           ;
+                                           }},
+                                           
+                                           /**
+                                            * Check if a SIP message contains a session description.
+                                            * @param {SIP.SIPMessage} message
+                                            * @returns {boolean}
+                                            */
+                                           hasDescription: {writeable: true, value: function hasDescription (message) {
+                                           return message.getHeader('Content-Type') === 'application/sdp' && !!message.body;
+                                           }},
+                                           
+                                           /**
+                                            * Set the session description contained in a SIP message.
+                                            * @param {SIP.SIPMessage} message
+                                            * @returns {Promise}
+                                            */
+                                           setDescription: {writable: true, value: function setDescription (message) {
+                                           var self = this;
+                                           var sdp = message.body;
+                                           
+                                           this.remote_hold = /a=(sendonly|inactive)/.test(sdp);
+                                           
+                                           sdp = SIP.Hacks.Firefox.cannotHandleExtraWhitespace(sdp);
+                                           sdp = SIP.Hacks.AllBrowsers.maskDtls(sdp);
+                                           
+                                           var rawDescription = {
+                                           type: this.hasOffer('local') ? 'answer' : 'offer',
+                                           sdp: sdp
+                                           };
+                                           
+                                           this.emit('setDescription', rawDescription);
+                                           
+                                           var description = new SIP.WebRTC.RTCSessionDescription(rawDescription);
+                                           return SIP.Utils.promisify(this.peerConnection, 'setRemoteDescription')(description)
+                                           .catch(function setRemoteDescriptionError(e) {
+                                                  self.emit('peerConnection-setRemoteDescriptionFailed', e);
+                                                  throw e;
+                                                  });
+                                           }},
+                                           
+                                           /**
+                                            * If the Session associated with this MediaHandler were to be referred,
+                                            * what mediaHint should be provided to the UA's invite method?
+                                            */
+                                           getReferMedia: {writable: true, value: function getReferMedia () {
+                                           function hasTracks (trackGetter, stream) {
+                                           return stream[trackGetter]().length > 0;
+                                           }
+                                           
+                                           function bothHaveTracks (trackGetter) {
+                                           /* jshint validthis:true */
+                                           return this.getLocalStreams().some(hasTracks.bind(null, trackGetter)) &&
+                                           this.getRemoteStreams().some(hasTracks.bind(null, trackGetter));
+                                           }
+                                           
+                                           return {
+                                           constraints: {
+                                           audio: bothHaveTracks.call(this, 'getAudioTracks'),
+                                           video: bothHaveTracks.call(this, 'getVideoTracks')
+                                           }
+                                           };
+                                           }},
+                                           
+                                           updateIceServers: {writeable:true, value: function (options) {
+                                           var servers = this.prepareIceServers(options.stunServers, options.turnServers);
+                                           this.RTCConstraints = options.RTCConstraints || this.RTCConstraints;
+                                           
+                                           this.initPeerConnection(servers);
+                                           
+                                           /* once updateIce is implemented correctly, this is better than above
+                                            //no op if browser does not support this
+                                            if (!this.peerConnection.updateIce) {
+                                            return;
+                                            }
+                                            
+                                            this.peerConnection.updateIce({'iceServers': servers}, this.RTCConstraints);
+                                            */
+                                           }},
+                                           
+                                           // Functions the session can use, but only because it's convenient for the application
+                                           isMuted: {writable: true, value: function isMuted () {
+                                           return {
+                                           audio: this.audioMuted,
+                                           video: this.videoMuted
+                                           };
+                                           }},
+                                           
+                                           mute: {writable: true, value: function mute (options) {
+                                           if (this.getLocalStreams().length === 0) {
+                                           return;
+                                           }
+                                           
+                                           options = options || {
+                                           audio: this.getLocalStreams()[0].getAudioTracks().length > 0,
+                                           video: this.getLocalStreams()[0].getVideoTracks().length > 0
+                                           };
+                                           
+                                           var audioMuted = false,
+                                           videoMuted = false;
+                                           
+                                           if (options.audio && !this.audioMuted) {
+                                           audioMuted = true;
+                                           this.audioMuted = true;
+                                           this.toggleMuteAudio(true);
+                                           }
+                                           
+                                           if (options.video && !this.videoMuted) {
+                                           videoMuted = true;
+                                           this.videoMuted = true;
+                                           this.toggleMuteVideo(true);
+                                           }
+                                           
+                                           //REVISIT
+                                           if (audioMuted || videoMuted) {
+                                           return {
+                                           audio: audioMuted,
+                                           video: videoMuted
+                                           };
+                                           /*this.session.onmute({
+                                            audio: audioMuted,
+                                            video: videoMuted
+                                            });*/
+                                           }
+                                           }},
+                                           
+                                           unmute: {writable: true, value: function unmute (options) {
+                                           if (this.getLocalStreams().length === 0) {
+                                           return;
+                                           }
+                                           
+                                           options = options || {
+                                           audio: this.getLocalStreams()[0].getAudioTracks().length > 0,
+                                           video: this.getLocalStreams()[0].getVideoTracks().length > 0
+                                           };
+                                           
+                                           var audioUnMuted = false,
+                                           videoUnMuted = false;
+                                           
+                                           if (options.audio && this.audioMuted) {
+                                           audioUnMuted = true;
+                                           this.audioMuted = false;
+                                           this.toggleMuteAudio(false);
+                                           }
+                                           
+                                           if (options.video && this.videoMuted) {
+                                           videoUnMuted = true;
+                                           this.videoMuted = false;
+                                           this.toggleMuteVideo(false);
+                                           }
+                                           
+                                           //REVISIT
+                                           if (audioUnMuted || videoUnMuted) {
+                                           return {
+                                           audio: audioUnMuted,
+                                           video: videoUnMuted
+                                           };
+                                           /*this.session.onunmute({
+                                            audio: audioUnMuted,
+                                            video: videoUnMuted
+                                            });*/
+                                           }
+                                           }},
+                                           
+                                           hold: {writable: true, value: function hold () {
+                                           this.local_hold = true;
+                                           this.toggleMuteAudio(true);
+                                           this.toggleMuteVideo(true);
+                                           }},
+                                           
+                                           unhold: {writable: true, value: function unhold () {
+                                           this.local_hold = false;
+                                           
+                                           if (!this.audioMuted) {
+                                           this.toggleMuteAudio(false);
+                                           }
+                                           
+                                           if (!this.videoMuted) {
+                                           this.toggleMuteVideo(false);
+                                           }
+                                           }},
+                                           
+                                           // Functions the application can use, but not the session
+                                           getLocalStreams: {writable: true, value: function getLocalStreams () {
+                                           var pc = this.peerConnection;
+                                           if (pc && pc.signalingState === 'closed') {
+                                           this.logger.warn('peerConnection is closed, getLocalStreams returning []');
+                                           return [];
+                                           }
+                                           return (pc.getLocalStreams && pc.getLocalStreams()) ||
+                                           pc.localStreams || [];
+                                           }},
+                                           
+                                           getRemoteStreams: {writable: true, value: function getRemoteStreams () {
+                                           var pc = this.peerConnection;
+                                           if (pc && pc.signalingState === 'closed') {
+                                           this.logger.warn('peerConnection is closed, getRemoteStreams returning this._remoteStreams');
+                                           return this._remoteStreams;
+                                           }
+                                           return(pc.getRemoteStreams && pc.getRemoteStreams()) ||
+                                           pc.remoteStreams || [];
+                                           }},
+                                           
+                                           render: {writable: true, value: function render (renderHint) {
+                                           renderHint = renderHint || (this.mediaHint && this.mediaHint.render);
+                                           if (!renderHint) {
+                                           return false;
+                                           }
+                                           var streamGetters = {
+                                           local: 'getLocalStreams',
+                                           remote: 'getRemoteStreams'
+                                           };
+                                           Object.keys(streamGetters).forEach(function (loc) {
+                                                                              var streamGetter = streamGetters[loc];
+                                                                              var streams = this[streamGetter]();
+                                                                              SIP.WebRTC.MediaStreamManager.render(streams, renderHint[loc]);
+                                                                              }.bind(this));
+                                           }},
+                                           
+                                           // Internal functions
+                                           hasOffer: {writable: true, value: function hasOffer (where) {
+                                           var offerState = 'have-' + where + '-offer';
+                                           return this.peerConnection.signalingState === offerState;
+                                           // TODO consider signalingStates with 'pranswer'?
+                                           }},
+                                           
+                                           prepareIceServers: {writable: true, value: function prepareIceServers (stunServers, turnServers) {
+                                           var servers = [],
+                                           config = this.session.ua.configuration;
+                                           
+                                           stunServers = stunServers || config.stunServers;
+                                           turnServers = turnServers || config.turnServers;
+                                           
+                                           [].concat(stunServers).forEach(function (server) {
+                                                                          servers.push({'urls': server});
+                                                                          });
+                                           
+                                           [].concat(turnServers).forEach(function (server) {
+                                                                          var turnServer = {'urls': server.urls};
+                                                                          if (server.username) {
+                                                                          turnServer.username = server.username;
+                                                                          }
+                                                                          if (server.password) {
+                                                                          turnServer.credential = server.password;
+                                                                          }
+                                                                          servers.push(turnServer);
+                                                                          });
+                                           
+                                           return servers;
+                                           }},
+                                           
+                                           initPeerConnection: {writable: true, value: function initPeerConnection(servers) {
+                                           var self = this,
+                                           config = this.session.ua.configuration;
+                                           
+                                           this.onIceCompleted = SIP.Utils.defer();
+                                           this.onIceCompleted.promise.then(function(pc) {
+                                                                            self.emit('iceGatheringComplete', pc);
+                                                                            if (self.iceCheckingTimer) {
+                                                                            SIP.Timers.clearTimeout(self.iceCheckingTimer);
+                                                                            self.iceCheckingTimer = null;
+                                                                            }
+                                                                            });
+                                           
+                                           if (this.peerConnection) {
+                                           this.peerConnection.close();
+                                           }
+                                           
+                                           var connConfig = {
+                                           iceServers: servers
+                                           };
+                                           
+                                           if (config.rtcpMuxPolicy) {
+                                           connConfig.rtcpMuxPolicy = config.rtcpMuxPolicy;
+                                           }
+                                           
+                                           this.peerConnection = new RTCPeerConnection(connConfig);
+                                           
+                                           // Firefox (35.0.1) sometimes throws on calls to peerConnection.getRemoteStreams
+                                           // even if peerConnection.onaddstream was just called. In order to make
+                                           // MediaHandler.prototype.getRemoteStreams work, keep track of them manually
+                                           this._remoteStreams = [];
+                                           
+                                           this.peerConnection.onaddstream = function(e) {
+                                           self.logger.log('stream added: '+ e.stream.id);
+                                           self._remoteStreams.push(e.stream);
+                                           self.render();
+                                           self.emit('addStream', e);
+                                           };
+                                           
+                                           this.peerConnection.onremovestream = function(e) {
+                                           self.logger.log('stream removed: '+ e.stream.id);
+                                           };
+                                           
+                                           this.startIceCheckingTimer = function () {
+                                           if (!self.iceCheckingTimer) {
+                                           self.iceCheckingTimer = SIP.Timers.setTimeout(function() {
+                                                                                         self.logger.log('RTCIceChecking Timeout Triggered after '+config.iceCheckingTimeout+' milliseconds');
+                                                                                         self.onIceCompleted.resolve(this);
+                                                                                         }.bind(this.peerConnection), config.iceCheckingTimeout);
+                                           }
+                                           };
+                                           
+                                           this.peerConnection.onicecandidate = function(e) {
+                                           self.emit('iceCandidate', e);
+                                           if (e.candidate) {
+                                           self.candidates.push(e.candidate.candidate);
+                                           self.logger.log('ICE candidate received: '+ (e.candidate.candidate === null ? null : e.candidate.candidate.trim()));
+                                           self.startIceCheckingTimer();
+                                           } else {
+                                           self.onIceCompleted.resolve(this);
+                                           }
+                                           };
+                                           
+                                           this.peerConnection.onicegatheringstatechange = function () {
+                                           self.logger.log('RTCIceGatheringState changed: ' + this.iceGatheringState);
+                                           if (this.iceGatheringState === 'gathering') {
+                                           self.emit('iceGathering', this);
+                                           }
+                                           if (this.iceGatheringState === 'complete') {
+                                           self.onIceCompleted.resolve(this);
+                                           }
+                                           };
+                                           
+                                           this.peerConnection.oniceconnectionstatechange = function() {  //need e for commented out case
+                                           var stateEvent;
+                                           
+                                           if (this.iceConnectionState === 'checking') {
+                                           self.startIceCheckingTimer();
+                                           }
+                                           
+                                           switch (this.iceConnectionState) {
+                                           case 'new':
+                                           stateEvent = 'iceConnection';
+                                           break;
+                                           case 'checking':
+                                           stateEvent = 'iceConnectionChecking';
+                                           break;
+                                           case 'connected':
+                                           stateEvent = 'iceConnectionConnected';
+                                           break;
+                                           case 'completed':
+                                           stateEvent = 'iceConnectionCompleted';
+                                           break;
+                                           case 'failed':
+                                           stateEvent = 'iceConnectionFailed';
+                                           break;
+                                           case 'disconnected':
+                                           stateEvent = 'iceConnectionDisconnected';
+                                           break;
+                                           case 'closed':
+                                           stateEvent = 'iceConnectionClosed';
+                                           break;
+                                           default:
+                                           self.logger.warn('Unknown iceConnection state:', this.iceConnectionState);
+                                           return;
+                                           }
+                                           self.emit(stateEvent, this);
+                                           
+                                           //Bria state changes are always connected -> disconnected -> connected on accept, so session gets terminated
+                                           //normal calls switch from failed to connected in some cases, so checking for failed and terminated
+                                           /*if (this.iceConnectionState === 'failed') {
+                                            self.session.terminate({
+                                            cause: SIP.C.causes.RTP_TIMEOUT,
+                                            status_code: 200,
+                                            reason_phrase: SIP.C.causes.RTP_TIMEOUT
+                                            });
+                                            } else if (e.currentTarget.iceGatheringState === 'complete' && this.iceConnectionState !== 'closed') {
+                                            self.onIceCompleted(this);
+                                            }*/
+                                           };
+                                           
+                                           this.peerConnection.onstatechange = function() {
+                                           self.logger.log('PeerConnection state changed to "'+ this.readyState +'"');
+                                           };
+                                           }},
+                                           
+                                           createOfferOrAnswer: {writable: true, value: function createOfferOrAnswer (constraints) {
+                                           var self = this;
+                                           var methodName;
+                                           var pc = self.peerConnection;
+                                           
+                                           self.ready = false;
+                                           methodName = self.hasOffer('remote') ? 'createAnswer' : 'createOffer';
+                                           
+                                           return SIP.Utils.promisify(pc, methodName, true)(constraints)
+                                           .catch(function methodError(e) {
+                                                  self.emit('peerConnection-' + methodName + 'Failed', e);
+                                                  throw e;
+                                                  })
+                                           .then(SIP.Utils.promisify(pc, 'setLocalDescription'))
+                                           .catch(function localDescError(e) {
+                                                  self.emit('peerConnection-selLocalDescriptionFailed', e);
+                                                  throw e;
+                                                  })
+                                           .then(function onSetLocalDescriptionSuccess() {
+                                                 var deferred = SIP.Utils.defer();
+                                                 if (pc.iceGatheringState === 'complete' && (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed')) {
+                                                 deferred.resolve();
+                                                 } else {
+                                                 self.onIceCompleted.promise.then(deferred.resolve);
+                                                 }
+                                                 return deferred.promise;
+                                                 })
+                                           .then(function readySuccess () {
+                                                 var sdp = pc.localDescription.sdp;
+                                                 /*var candidate = self.candidates[0].trim();
+                                                 var candarr = candidate.split(" ");
+                                                 var host = candarr[4];
+                                                 var port = candarr[5];
+                                                 sdp = sdp.replace(/0.0.0.0/g,host);
+                                                 sdp = sdp.replace("m=audio 9 ","m=audio "+port+" ");
+                                                 sdp = sdp.replace("a=rtcp:9 ","a=rtcp:"+port+" ");*/
+                                                 //sdp=sdp.replace(/^a=ice.*?\r\n/img,"");
+                                                 //sdp+='a='+candidate+'\r\n';
+                                                 for(var index in self.candidates) {
+                                                    sdp+='a='+self.candidates[index].trim()+'\r\n';
+                                                 }
+                                                 sdp = SIP.Hacks.Chrome.needsExplicitlyInactiveSDP(sdp);
+                                                 sdp = SIP.Hacks.AllBrowsers.unmaskDtls(sdp);
+                                                 
+                                                 var sdpWrapper = {
+                                                 type: methodName === 'createOffer' ? 'offer' : 'answer',
+                                                 sdp: sdp
+                                                 };
+                                                 
+                                                 self.emit('getDescription', sdpWrapper);
+                                                 
+                                                 if (self.session.ua.configuration.hackStripTcp) {
+                                                 sdpWrapper.sdp = sdpWrapper.sdp.replace(/^a=candidate:\d+ \d+ tcp .*?\r\n/img, "");
+                                                 }
+                                                 
+                                                 self.ready = true;
+                                                 return sdpWrapper.sdp;
+                                                 })
+                                           .catch(function createOfferAnswerError (e) {
+                                                  self.logger.error(e);
+                                                  self.ready = true;
+                                                  throw new SIP.Exceptions.GetDescriptionError(e);
+                                                  })
+                                           ;
+                                           }},
+                                           
+                                           addStreams: {writable: true, value: function addStreams (streams) {
+                                           try {
+                                           streams = [].concat(streams);
+                                           streams.forEach(function (stream) {
+                                                           this.peerConnection.addStream(stream);
+                                                           }, this);
+                                           } catch(e) {
+                                           this.logger.error('error adding stream');
+                                           this.logger.error(e);
+                                           return SIP.Utils.Promise.reject(e);
+                                           }
+                                           
+                                           return SIP.Utils.Promise.resolve();
+                                           }},
+                                           
+                                           toggleMuteHelper: {writable: true, value: function toggleMuteHelper (trackGetter, mute) {
+                                           this.getLocalStreams().forEach(function (stream) {
+                                                                          stream[trackGetter]().forEach(function (track) {
+                                                                                                        track.enabled = !mute;
+                                                                                                        });
+                                                                          });
+                                           }},
+                                           
+                                           toggleMuteAudio: {writable: true, value: function toggleMuteAudio (mute) {
+                                           this.toggleMuteHelper('getAudioTracks', mute);
+                                           }},
+                                           
+                                           toggleMuteVideo: {writable: true, value: function toggleMuteVideo (mute) {
+                                           this.toggleMuteHelper('getVideoTracks', mute);
+                                           }}
+                                           });
+
+var sipconfiguration = {
+    uri      : '1001@www.roam-tech.com',
+ws_servers: 'ws://www.roam-tech.com:5066',
+authorizationUser: '1001',
+    password : '1234',
+    hackStripTcp : true,
+    iceCheckingTimeout : 1000,
+	mediaHandlerFactory : MediaHandler.defaultFactory
+};
+
+var ua = new SIP.UA(sipconfiguration);
+let currentSession;
+function setupSessionListener(session) {
+	currentSession = session;
+	session.on('accepted', function() {
+	  //if(currentSession.accept) {
+        container.setState({status: 'incall', info: 'during a call'});
+	  //}
+    });
+	session.on('bye', function() {
+		currentSession=null;
+        container.setState({status: 'ready', info: 'Please enter callee number'});
+    });
+	session.on('failed', function() {
+		currentSession=null;
+        container.setState({status: 'ready', info: 'Please enter callee number'});
+    });
+}
+ua.on('registered',function () {
+     container.setState({status: 'ready', info: 'Please enter callee number'});
+});
+ua.on('invite', function (session) {
+	setupSessionListener(session);
+    container.setState({status: 'ready', info: 'Incoming call '+session.remoteIdentity.uri});
+});
+
+function call(callee) {
+	var options = {
+	    media: {
+		  constraints: {
+		    audio: true,
+		    video: false
+		  }
+	    },
+		mediaHandlerFactory : MediaHandler.defaultFactory
+	  };
+    var session = ua.invite('sip:'+callee+'@www.roam-tech.com', options);
+	setupSessionListener(session);
+    console.log('call', session);
+}
+//var session = ua.invite('sip:5000@www.roam-tech.com', options);
+/*
 function getLocalStream(isFront, callback) {
 
   let videoSourceId;
@@ -51,15 +733,7 @@ function getLocalStream(isFront, callback) {
   }
   getUserMedia({
     audio: true,
-    video: {
-      mandatory: {
-        minWidth: 640, // Provide your own width, height and frame rate here
-        minHeight: 360,
-        minFrameRate: 30,
-      },
-      facingMode: (isFront ? "user" : "environment"),
-      optional: (videoSourceId ? [{sourceId: videoSourceId}] : []),
-    }
+    video: false
   }, function (stream) {
     console.log('getUserMedia success', stream);
     callback(stream);
@@ -216,7 +890,7 @@ socket.on('connect', function(data) {
     container.setState({status: 'ready', info: 'Please enter or create room ID'});
   });
 });
-
+*/
 function logError(error) {
   console.log("logError", error);
 }
@@ -263,8 +937,26 @@ const RCTWebRTCDemo = React.createClass({
   },
   _press(event) {
     this.refs.roomID.blur();
-    this.setState({status: 'connect', info: 'Connecting'});
-    join(this.state.roomID);
+	if(currentSession == null) {
+      this.setState({status: 'outgoing', info: 'Outgoing'});
+	  call(this.state.roomID);
+	} else if(currentSession.accept && !currentSession.startTime){
+	  var options = {
+	    media: {
+		  constraints: {
+		    audio: true,
+		    video: false
+		  }
+	    }
+	  };
+	  currentSession.accept(options);
+	} else if (currentSession.startTime) { // Connected
+      currentSession.bye();
+    } else if (currentSession.reject) { // Incoming
+      currentSession.reject();
+    } else if (currentSession.cancel) { // Outbound
+      currentSession.cancel();
+    }   
   },
   _switchVideoType() {
     const isFront = !this.state.isFront;
@@ -329,16 +1021,6 @@ const RCTWebRTCDemo = React.createClass({
           {this.state.info}
         </Text>
         {this.state.textRoomConnected && this._renderTextRoom()}
-        <View style={{flexDirection: 'row'}}>
-          <Text>
-            {this.state.isFront ? "Use front camera" : "Use back camera"}
-          </Text>
-          <TouchableHighlight
-            style={{borderWidth: 1, borderColor: 'black'}}
-            onPress={this._switchVideoType}>
-            <Text>Switch camera</Text>
-          </TouchableHighlight>
-        </View>
         { this.state.status == 'ready' ?
           (<View>
             <TextInput
@@ -350,7 +1032,23 @@ const RCTWebRTCDemo = React.createClass({
             />
             <TouchableHighlight
               onPress={this._press}>
-              <Text>Enter room</Text>
+			  <Text>{currentSession != null?"Accept":"Invite"}</Text>
+            </TouchableHighlight>
+          </View>) : null
+        }
+		{
+			this.state.status == 'incall' ?
+          (<View>
+            <TextInput
+              ref='roomID'
+              autoCorrect={false}
+              style={{width: 200, height: 40, borderColor: 'gray', borderWidth: 1}}
+              onChangeText={(text) => this.setState({roomID: text})}
+              value={this.state.roomID}
+            />
+            <TouchableHighlight
+              onPress={this._press}>
+              <Text>Bye</Text>
             </TouchableHighlight>
           </View>) : null
         }
